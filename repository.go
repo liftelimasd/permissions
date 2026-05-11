@@ -24,6 +24,7 @@ type Repository interface {
 
 	// User permissions
 	ListUserPermissions(userID int) ([]UserPermission, error)
+	ListUserPermissionsByUserIDs(userIDs []int) ([]UserPermission, error)
 	UpsertUserPermission(up *UserPermission) error
 	DeleteUserPermission(userID, permissionTypeID int) error
 	DeleteAllUserPermissions(userID int) error

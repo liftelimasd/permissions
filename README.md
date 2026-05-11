@@ -70,12 +70,34 @@ permSvc := permissions.NewService(repo)
 
 ### 3. Implementar `UserFinder`
 
-El paquete HTTP necesita resolver `username → userID` pero no conoce tu tabla de usuarios. Implementa una función:
+El paquete HTTP traduce `username → userID` en cada request a `/users/:username`. Para eso necesita que implementes la interfaz `ginhttp.UserFinder`:
+
+```go
+type UserFinder interface {
+    FindUserID(username string) (int, error)
+}
+```
+
+**Esta interfaz la escribes tú** en tu servicio. La librería no sabe nada de tu modelo de usuarios: solo llama a `FindUserID` y espera un `int`. Si el usuario no existe, devuelve un error y el endpoint responde `404 user not found`.
+
+#### Requisito: tabla `users` en tu servicio
+
+Para que el `UserFinder` funcione, **tu servicio necesita una tabla de usuarios** con al menos `id` (INT) y `username` (VARCHAR). Ejemplo mínimo:
+
+```sql
+CREATE TABLE users (
+    id       INT          NOT NULL AUTO_INCREMENT,
+    username VARCHAR(100) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_username (username)
+);
+```
+
+La implementación típica del `UserFinder` apunta a esa tabla:
 
 ```go
 import ginhttp "github.com/liftelimasd/permissions/ginhttp"
 
-// Implementa la interfaz ginhttp.UserFinder
 type myUserFinder struct{ db *gorm.DB }
 
 func (f *myUserFinder) FindUserID(username string) (int, error) {
@@ -87,6 +109,13 @@ func (f *myUserFinder) FindUserID(username string) (int, error) {
     return u.ID, err
 }
 ```
+
+#### Alternativas si no tienes tabla propia de usuarios
+
+- **Auth service externo** (Keycloak, Auth0, etc.): implementa `FindUserID` haciendo una llamada HTTP al servicio de identidad para obtener el ID numérico del usuario.
+- **Sin IDs numéricos**: si tu sistema identifica usuarios solo por string (email, sub de JWT), puedes mantener una tabla mínima `{id, username}` solo para este mapeo, o adaptar el `UserFinder` para generar/recuperar un ID a partir del username de forma determinista.
+
+> El campo `user_id` en `user_permissions` no tiene FK hacia ninguna tabla de usuarios — la librería lo deja intencionalmente como entero opaco. Si quieres añadir la FK en tu migración, puedes hacerlo sin tocar este paquete.
 
 ### 4. Registrar las rutas HTTP
 
@@ -131,6 +160,59 @@ Respuesta resultante:
 
 ---
 
+## Resolución por lotes (`ResolveBatch`)
+
+Para endpoints que devuelven listas de usuarios y necesitan incluir los permisos de cada uno, usa `ResolveBatch`. Hace **3 queries totales** independientemente del número de usuarios (vs `N × 3` queries de llamar a `Resolve` en bucle).
+
+```go
+input := []permissions.UserRoles{
+    {UserID: 12, Roles: []string{"admin"}},
+    {UserID: 13, Roles: []string{"editor"}},
+    {UserID: 14, Roles: []string{"viewer", "editor"}},
+}
+
+permsByUser, err := permSvc.ResolveBatch(input)
+// permsByUser[12] → map[string]int{ "screensAcceso": 3, ... }
+// permsByUser[13] → map[string]int{ "screensAcceso": 1, ... }
+```
+
+Mismas reglas de resolución que `Resolve` (defaults → roles con máximo → overrides incondicionales).
+
+---
+
+## Usernames vs IDs
+
+La librería trabaja con dos identificadores distintos según la capa:
+
+| Capa | Identificador | Ejemplo |
+|------|--------------|---------|
+| API HTTP (URL) | `username` string | `/users/vicenteT` |
+| Base de datos | `user_id` int | `user_id: 42` |
+
+En cada request a `/users/:username`, el handler llama a `UserFinder.FindUserID` para obtener el ID numérico antes de tocar la base de datos. **El username nunca se persiste** — solo existe en la URL.
+
+### Flujo de autorización (responsabilidad del servicio anfitrión)
+
+La librería no valida que el username de la URL coincida con el del token JWT. Eso es responsabilidad tuya. Las opciones habituales:
+
+- **Middleware de auth**: antes de que llegue al handler de permisos, tu middleware comprueba que el usuario del token tiene permiso para gestionar permisos de ese username (p.ej. es admin, o es el propio usuario).
+- **Endpoint `/me`**: expones `/permissions/me/resolved` en tu servicio que extrae el username del token directamente, sin aceptarlo como parámetro de URL.
+
+```go
+// Ejemplo: middleware que restringe /users/:username al propio usuario o a admins
+protected.Use(func(c *gin.Context) {
+    tokenUser := c.GetString("username") // set by your auth middleware
+    paramUser := c.Param("username")
+    if tokenUser != paramUser && !isAdmin(c) {
+        c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+        return
+    }
+    c.Next()
+})
+```
+
+---
+
 ## Endpoints
 
 Todos quedan bajo el prefijo que uses en `RegisterRoutes` (en los ejemplos, `/permissions`).
@@ -169,6 +251,32 @@ Todos quedan bajo el prefijo que uses en `RegisterRoutes` (en los ejemplos, `/pe
 | `DELETE` | `/users/:username/:key` | — | Quitar un override |
 | `POST` | `/users/:username/reset` | — | Borrar todos los overrides (vuelve a los de rol) |
 | `GET` | `/users/:username/resolved` | — | Preview del mapa resuelto (útil para debug/admin) |
+
+> Si el username no existe en tu tabla de usuarios, todos estos endpoints devuelven `404 user not found`. La librería **no crea usuarios**.
+
+#### Ejemplo: asignar un permiso único a un usuario concreto
+
+Para dar acceso a `bestagent` solo a `vicenteT`, sin usar roles:
+
+**Paso 1** — Crear el tipo de permiso (una sola vez):
+```http
+POST /permissions/types
+{"key": "bestagent", "description": "Acceso a best agent", "defaultValue": 0}
+```
+
+**Paso 2** — Asignar el override al usuario:
+```http
+PUT /permissions/users/vicenteT
+{"permissions": {"bestagent": 1}}
+```
+
+**Verificar**:
+```http
+GET /permissions/users/vicenteT/resolved
+→ {"bestagent": 1, ...}
+```
+
+El resto de usuarios seguirán teniendo `bestagent: 0` (el `defaultValue`) a menos que también tengan un override o un rol con ese permiso.
 
 ---
 

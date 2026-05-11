@@ -170,6 +170,26 @@ func (r *repository) ListUserPermissions(userID int) ([]permissions.UserPermissi
 	return out, nil
 }
 
+func (r *repository) ListUserPermissionsByUserIDs(userIDs []int) ([]permissions.UserPermission, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	var ms []UserPermissionModel
+	if err := r.db.Where("user_id IN ?", userIDs).Find(&ms).Error; err != nil {
+		return nil, err
+	}
+	out := make([]permissions.UserPermission, len(ms))
+	for i, m := range ms {
+		out[i] = permissions.UserPermission{
+			ID:               m.ID,
+			UserID:           m.UserID,
+			PermissionTypeID: m.PermissionTypeID,
+			Value:            int(m.Value),
+		}
+	}
+	return out, nil
+}
+
 func (r *repository) UpsertUserPermission(up *permissions.UserPermission) error {
 	now := time.Now()
 	m := UserPermissionModel{
