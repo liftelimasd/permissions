@@ -3,7 +3,7 @@ package permgorm
 import (
 	"time"
 
-	permissions "github.com/liftelimasd/permissions"
+	permissions "github.com/liftelimasd/permissions/v2"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -18,6 +18,48 @@ var _ permissions.Repository = (*repository)(nil)
 // Pass your already-initialized *gorm.DB — this package never opens connections.
 func NewRepository(db *gorm.DB) permissions.Repository {
 	return &repository{db: db}
+}
+
+// --- Applications ---
+
+func (r *repository) ListApplications() ([]permissions.Application, error) {
+	var ms []ApplicationModel
+	if err := r.db.Find(&ms).Error; err != nil {
+		return nil, err
+	}
+	out := make([]permissions.Application, len(ms))
+	for i, m := range ms {
+		out[i] = appModelToDomain(m)
+	}
+	return out, nil
+}
+
+func (r *repository) GetApplication(key string) (*permissions.Application, error) {
+	var m ApplicationModel
+	if err := r.db.Where("`key` = ?", key).First(&m).Error; err != nil {
+		return nil, err
+	}
+	app := appModelToDomain(m)
+	return &app, nil
+}
+
+func (r *repository) CreateApplication(app *permissions.Application) error {
+	m := appToModel(app)
+	return r.db.Create(&m).Error
+}
+
+func (r *repository) UpdateApplication(app *permissions.Application) error {
+	return r.db.Model(&ApplicationModel{}).
+		Where("`key` = ?", app.Key).
+		Updates(map[string]any{
+			"name":        app.Name,
+			"description": app.Description,
+			"updated_at":  time.Now(),
+		}).Error
+}
+
+func (r *repository) DeleteApplication(key string) error {
+	return r.db.Where("`key` = ?", key).Delete(&ApplicationModel{}).Error
 }
 
 // --- Roles ---
@@ -81,13 +123,25 @@ func (r *repository) GetType(id int) (*permissions.PermissionType, error) {
 	return &pt, nil
 }
 
-func (r *repository) GetTypeByKey(key string) (*permissions.PermissionType, error) {
+func (r *repository) GetTypeByKey(appKey, key string) (*permissions.PermissionType, error) {
 	var m PermissionTypeModel
-	if err := r.db.Where("`key` = ?", key).First(&m).Error; err != nil {
+	if err := r.db.Where("application_key = ? AND `key` = ?", appKey, key).First(&m).Error; err != nil {
 		return nil, err
 	}
 	pt := permTypeModelToDomain(m)
 	return &pt, nil
+}
+
+func (r *repository) ListTypesByApp(appKey string) ([]permissions.PermissionType, error) {
+	var ms []PermissionTypeModel
+	if err := r.db.Where("application_key = ?", appKey).Find(&ms).Error; err != nil {
+		return nil, err
+	}
+	out := make([]permissions.PermissionType, len(ms))
+	for i, m := range ms {
+		out[i] = permTypeModelToDomain(m)
+	}
+	return out, nil
 }
 
 func (r *repository) CreateType(pt *permissions.PermissionType) error {
@@ -217,6 +271,69 @@ func (r *repository) DeleteAllUserPermissions(userID int) error {
 	return r.db.Where("user_id = ?", userID).Delete(&UserPermissionModel{}).Error
 }
 
+// --- Audit log ---
+
+func (r *repository) InsertAuditLog(log *permissions.AuditLog) error {
+	now := time.Now()
+	var meta *string
+	if log.Metadata != "" {
+		m := log.Metadata
+		meta = &m
+	}
+	m := AuditLogModel{
+		ActorUserID:      log.ActorUserID,
+		Action:           string(log.Action),
+		TargetType:       string(log.TargetType),
+		TargetID:         log.TargetID,
+		PermissionTypeID: log.PermissionTypeID,
+		OldValue:         log.OldValue,
+		NewValue:         log.NewValue,
+		Metadata:         meta,
+		CreatedAt:        &now,
+	}
+	if err := r.db.Create(&m).Error; err != nil {
+		return err
+	}
+	log.ID = m.ID
+	log.CreatedAt = now.Unix()
+	return nil
+}
+
+func (r *repository) ListAuditLogs(offset, limit int) ([]permissions.AuditLog, int, error) {
+	var total int64
+	if err := r.db.Model(&AuditLogModel{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var ms []AuditLogModel
+	if err := r.db.Order("id DESC").Offset(offset).Limit(limit).Find(&ms).Error; err != nil {
+		return nil, 0, err
+	}
+	out := make([]permissions.AuditLog, len(ms))
+	for i, m := range ms {
+		meta := ""
+		if m.Metadata != nil {
+			meta = *m.Metadata
+		}
+		var created int64
+		if m.CreatedAt != nil {
+			created = m.CreatedAt.Unix()
+		}
+		out[i] = permissions.AuditLog{
+			ID:               m.ID,
+			ActorUserID:      m.ActorUserID,
+			Action:           permissions.AuditAction(m.Action),
+			TargetType:       permissions.AuditTarget(m.TargetType),
+			TargetID:         m.TargetID,
+			PermissionTypeID: m.PermissionTypeID,
+			OldValue:         m.OldValue,
+			NewValue:         m.NewValue,
+			Metadata:         meta,
+			CreatedAt:        created,
+		}
+	}
+	return out, int(total), nil
+}
+
 // --- mappers ---
 
 func roleModelToDomain(m RoleModel) permissions.Role {
@@ -239,10 +356,11 @@ func permTypeModelToDomain(m PermissionTypeModel) permissions.PermissionType {
 		desc = *m.Description
 	}
 	return permissions.PermissionType{
-		ID:           m.ID,
-		Key:          m.Key,
-		Description:  desc,
-		DefaultValue: int(m.DefaultValue),
+		ID:             m.ID,
+		ApplicationKey: m.ApplicationKey,
+		Key:            m.Key,
+		Description:    desc,
+		DefaultValue:   int(m.DefaultValue),
 	}
 }
 
@@ -250,11 +368,32 @@ func permTypeToModel(pt *permissions.PermissionType) PermissionTypeModel {
 	now := time.Now()
 	desc := pt.Description
 	return PermissionTypeModel{
-		Key:          pt.Key,
-		Description:  &desc,
-		DefaultValue: int8(pt.DefaultValue),
-		CreatedAt:    &now,
-		UpdatedAt:    &now,
+		ApplicationKey: pt.ApplicationKey,
+		Key:            pt.Key,
+		Description:    &desc,
+		DefaultValue:   int8(pt.DefaultValue),
+		CreatedAt:      &now,
+		UpdatedAt:      &now,
+	}
+}
+
+func appModelToDomain(m ApplicationModel) permissions.Application {
+	desc := ""
+	if m.Description != nil {
+		desc = *m.Description
+	}
+	return permissions.Application{Key: m.Key, Name: m.Name, Description: desc}
+}
+
+func appToModel(a *permissions.Application) ApplicationModel {
+	now := time.Now()
+	desc := a.Description
+	return ApplicationModel{
+		Key:         a.Key,
+		Name:        a.Name,
+		Description: &desc,
+		CreatedAt:   &now,
+		UpdatedAt:   &now,
 	}
 }
 

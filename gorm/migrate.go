@@ -6,9 +6,11 @@ import "gorm.io/gorm"
 // Call this after connecting your DB and before starting the HTTP server.
 func Migrate(db *gorm.DB) error {
 	return db.AutoMigrate(
+		&ApplicationModel{},
 		&RoleModel{},
 		&PermissionTypeModel{},
 		&RolePermissionModel{},
 		&UserPermissionModel{},
+		&AuditLogModel{},
 	)
 }

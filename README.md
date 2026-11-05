@@ -1,288 +1,326 @@
 # permissions
 
-Sistema de permisos dinámicos por rol y por usuario para servicios Go.
+Sistema de permisos centralizado, multi-aplicación, con roles, overrides por usuario y auditoría — pensado para un servicio `usersmanager` que dé soporte a múltiples aplicaciones (sat01, cloud, etc.).
+
+> **Breaking changes vs. v1.** Esta versión introduce el concepto de `application`, cambia firmas de `Resolve`, sustituye `UserFinder` por `UserDirectory` y añade auditoría. Si tu servicio sigue en v1, no actualices a v2 hasta migrar.
 
 ## Instalación
 
 ```bash
-go get github.com/liftelimasd/permissions@latest
+go get github.com/liftelimasd/permissions/v2@latest
 ```
-
-Importa solo los subpaquetes que necesites:
 
 ```go
 import (
-    "github.com/liftelimasd/permissions"           // núcleo (siempre)
-    permgorm   "github.com/liftelimasd/permissions/gorm"     // si usas GORM
-    ginhttp    "github.com/liftelimasd/permissions/ginhttp"  // si usas Gin
+    "github.com/liftelimasd/permissions/v2"
+    permgorm "github.com/liftelimasd/permissions/v2/gorm"
+    ginhttp  "github.com/liftelimasd/permissions/v2/ginhttp"
 )
 ```
 
 ---
 
-## Cómo funciona
+## Modelo
 
-Tres tablas cooperan para producir un `map[string]int` de permisos en cada login:
+Cinco tablas:
 
 | Tabla | Qué guarda |
 |-------|-----------|
-| `permission_types` | Catálogo de permisos disponibles (`key` + `default_value`) |
+| `applications` | Catálogo de aplicaciones (`sat01`, `cloud`, ...) |
+| `permission_types` | Catálogo de permisos por aplicación (`application_key + key + default_value`) |
+| `roles` | Roles globales (no namespaced por app) |
 | `role_permissions` | Valor de cada permiso para cada rol |
 | `user_permissions` | Overrides personalizados por usuario |
+| `permission_audit_log` | Registro de cada mutación (quién, qué, cuándo, antes/después) |
 
 Rango de valores: **0–3** (0 = sin acceso, 3 = acceso total).
 
-**Algoritmo de resolución** (`Resolve`):
-1. Semilla con `default_value` de cada `permission_type`.
-2. Para cada rol del usuario → aplica `role_permissions`. Si un permiso aparece en varios roles, **gana el mayor valor**.
-3. Aplica `user_permissions` **incondicionalmente** — el override de usuario siempre gana, sea mayor o menor que el de rol.
+**Resolución** (`Resolve`):
+1. Semilla con `default_value` de cada `permission_type` de la app.
+2. Para cada rol del usuario → aplica `role_permissions`. Si un permiso aparece en varios roles, **gana el mayor**.
+3. Aplica `user_permissions` **incondicionalmente** — el override de usuario siempre gana.
 
 ---
 
-## Integración en 5 pasos
+## Integración
 
-### 1. Conectar y migrar
+### 1. Migrar el schema
 
 ```go
-import (
-    permgorm "github.com/liftelimasd/permissions/gorm"
-)
-
-// db es tu *gorm.DB ya inicializado
 if err := permgorm.Migrate(db); err != nil {
     log.Fatalf("permissions migrate: %v", err)
 }
 ```
 
-Esto crea las cuatro tablas si no existen. Llámalo al arrancar el servicio, tras conectar la BD.
-
-### 2. Construir el repositorio y el servicio
+### 2. Construir el servicio
 
 ```go
-import (
-    "github.com/liftelimasd/permissions"
-    permgorm "github.com/liftelimasd/permissions/gorm"
-)
-
 repo    := permgorm.NewRepository(db)
 permSvc := permissions.NewService(repo)
 ```
 
-### 3. Implementar `UserFinder`
+### 3. Implementar `UserDirectory`
 
-El paquete HTTP traduce `username → userID` en cada request a `/users/:username`. Para eso necesita que implementes la interfaz `ginhttp.UserFinder`:
+El paquete no tiene tabla `users` propia. El host (tu `usersmanager`) la expone vía adaptador:
 
 ```go
-type UserFinder interface {
-    FindUserID(username string) (int, error)
+type UserDirectory interface {
+    FindByUsername(username string) (User, error)
+    FindByID(id int) (User, error)
+    List(offset, limit int) ([]User, int, error)
+}
+
+type User struct {
+    ID       int
+    Username string
 }
 ```
 
-**Esta interfaz la escribes tú** en tu servicio. La librería no sabe nada de tu modelo de usuarios: solo llama a `FindUserID` y espera un `int`. Si el usuario no existe, devuelve un error y el endpoint responde `404 user not found`.
-
-#### Requisito: tabla `users` en tu servicio
-
-Para que el `UserFinder` funcione, **tu servicio necesita una tabla de usuarios** con al menos `id` (INT) y `username` (VARCHAR). Ejemplo mínimo:
-
-```sql
-CREATE TABLE users (
-    id       INT          NOT NULL AUTO_INCREMENT,
-    username VARCHAR(100) NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_username (username)
-);
-```
-
-La implementación típica del `UserFinder` apunta a esa tabla:
+Ejemplo apuntando a una tabla con columnas distintas (`login` en vez de `username`):
 
 ```go
-import ginhttp "github.com/liftelimasd/permissions/ginhttp"
+type myDirectory struct{ db *gorm.DB }
 
-type myUserFinder struct{ db *gorm.DB }
+func (d *myDirectory) FindByUsername(username string) (ginhttp.User, error) {
+    var u struct{ ID int; Login string }
+    err := d.db.Table("users").Select("id, login").
+        Where("login = ?", username).First(&u).Error
+    return ginhttp.User{ID: u.ID, Username: u.Login}, err
+}
 
-func (f *myUserFinder) FindUserID(username string) (int, error) {
-    var u struct{ ID int }
-    err := f.db.Table("users").
-        Select("id").
-        Where("username = ?", username).
-        First(&u).Error
-    return u.ID, err
+func (d *myDirectory) FindByID(id int) (ginhttp.User, error) {
+    var u struct{ ID int; Login string }
+    err := d.db.Table("users").Select("id, login").
+        Where("id = ?", id).First(&u).Error
+    return ginhttp.User{ID: u.ID, Username: u.Login}, err
+}
+
+func (d *myDirectory) List(offset, limit int) ([]ginhttp.User, int, error) {
+    var total int64
+    d.db.Table("users").Count(&total)
+    var rows []struct{ ID int; Login string }
+    err := d.db.Table("users").Select("id, login").
+        Offset(offset).Limit(limit).Find(&rows).Error
+    out := make([]ginhttp.User, len(rows))
+    for i, r := range rows {
+        out[i] = ginhttp.User{ID: r.ID, Username: r.Login}
+    }
+    return out, int(total), err
 }
 ```
 
-#### Alternativas si no tienes tabla propia de usuarios
+El paquete nunca toca `password`, `companyId` u otros campos. Quedan bajo el control del host.
 
-- **Auth service externo** (Keycloak, Auth0, etc.): implementa `FindUserID` haciendo una llamada HTTP al servicio de identidad para obtener el ID numérico del usuario.
-- **Sin IDs numéricos**: si tu sistema identifica usuarios solo por string (email, sub de JWT), puedes mantener una tabla mínima `{id, username}` solo para este mapeo, o adaptar el `UserFinder` para generar/recuperar un ID a partir del username de forma determinista.
+### 4. Actor en el contexto (auditoría)
 
-> El campo `user_id` en `user_permissions` no tiene FK hacia ninguna tabla de usuarios — la librería lo deja intencionalmente como entero opaco. Si quieres añadir la FK en tu migración, puedes hacerlo sin tocar este paquete.
-
-### 4. Registrar las rutas HTTP
+Cada endpoint mutante necesita saber **quién** está haciendo la acción. Tu middleware de auth tiene que dejar el ID en el contexto de Gin:
 
 ```go
-import ginhttp "github.com/liftelimasd/permissions/ginhttp"
+protected.Use(func(c *gin.Context) {
+    userID := extractFromJWT(c) // tu lógica
+    c.Set("actorUserID", userID)
+    c.Next()
+})
+```
 
-// Pasa un RouterGroup que ya tenga tu middleware de autenticación aplicado
+Si el actor no está presente al llegar al handler, la respuesta es `401 unauthenticated`. Si prefieres otra clave o lógica, pásala al registrar rutas:
+
+```go
+ginhttp.RegisterRoutes(protected, permSvc, dir, func(c *gin.Context) (int, bool) {
+    // tu lógica custom
+})
+```
+
+Pasa `nil` para usar la lectura por defecto (`actorUserID` del contexto).
+
+### 5. Registrar rutas
+
+```go
 protected := router.Group("/permissions")
 protected.Use(tuAuthMiddleware())
-
-ginhttp.RegisterRoutes(protected, permSvc, &myUserFinder{db: db})
+ginhttp.RegisterRoutes(protected, permSvc, &myDirectory{db: db}, nil)
 ```
 
-Listo. Los endpoints quedan disponibles bajo `/permissions/...`.
+### 6. Devolver permisos en el login
 
-### 5. Añadir permisos a la respuesta de login
+**Patrón recomendado**: token JWT mínimo + permisos en el body, scopeados a la aplicación que hace login.
 
 ```go
-// roleNames viene de tu authservice (token, webhook, etc.)
-roleNames := []string{"admin", "editor"}
+app := ctx.Query("app") // "sat01", "cloud", "all", ...
 
-// best-effort: si falla, el login sigue funcionando sin el campo
-if perms, err := permSvc.Resolve(userID, roleNames); err == nil && len(perms) > 0 {
-    response.Permissions = perms
+if app == "all" && !isAdmin(user) {
+    // restringir: app=all solo para admins
+}
+
+if app == "all" {
+    perms, _ := permSvc.ResolveAll(userID, roleNames)
+    response.Permissions = perms // map[appKey]map[permKey]int
+} else {
+    perms, _ := permSvc.Resolve(userID, roleNames, app)
+    response.Permissions = perms // map[permKey]int (plano)
 }
 ```
 
-Respuesta resultante:
+Respuesta para un login normal (`app=sat01`):
 
 ```json
 {
-  "login": "usuario@empresa.com",
-  "companyId": 1,
-  "isPrimary": false,
+  "token": "eyJ...",
+  "permissions": { "crudSat": 3, "viewReports": 2 }
+}
+```
+
+Respuesta para el panel admin (`app=all`):
+
+```json
+{
+  "token": "eyJ...",
   "permissions": {
-    "screensAcceso": 1,
-    "screensLista": 3,
-    "reportesAcceso": 2
+    "sat01":        { "crudSat": 3, "viewReports": 2 },
+    "cloud":        { "crudCloud": 2 },
+    "usersmanager": { "manageUsers": 1 }
   }
 }
 ```
 
 ---
 
-## Resolución por lotes (`ResolveBatch`)
-
-Para endpoints que devuelven listas de usuarios y necesitan incluir los permisos de cada uno, usa `ResolveBatch`. Hace **3 queries totales** independientemente del número de usuarios (vs `N × 3` queries de llamar a `Resolve` en bucle).
-
-```go
-input := []permissions.UserRoles{
-    {UserID: 12, Roles: []string{"admin"}},
-    {UserID: 13, Roles: []string{"editor"}},
-    {UserID: 14, Roles: []string{"viewer", "editor"}},
-}
-
-permsByUser, err := permSvc.ResolveBatch(input)
-// permsByUser[12] → map[string]int{ "screensAcceso": 3, ... }
-// permsByUser[13] → map[string]int{ "screensAcceso": 1, ... }
-```
-
-Mismas reglas de resolución que `Resolve` (defaults → roles con máximo → overrides incondicionales).
-
----
-
-## Usernames vs IDs
-
-La librería trabaja con dos identificadores distintos según la capa:
-
-| Capa | Identificador | Ejemplo |
-|------|--------------|---------|
-| API HTTP (URL) | `username` string | `/users/vicenteT` |
-| Base de datos | `user_id` int | `user_id: 42` |
-
-En cada request a `/users/:username`, el handler llama a `UserFinder.FindUserID` para obtener el ID numérico antes de tocar la base de datos. **El username nunca se persiste** — solo existe en la URL.
-
-### Flujo de autorización (responsabilidad del servicio anfitrión)
-
-La librería no valida que el username de la URL coincida con el del token JWT. Eso es responsabilidad tuya. Las opciones habituales:
-
-- **Middleware de auth**: antes de que llegue al handler de permisos, tu middleware comprueba que el usuario del token tiene permiso para gestionar permisos de ese username (p.ej. es admin, o es el propio usuario).
-- **Endpoint `/me`**: expones `/permissions/me/resolved` en tu servicio que extrae el username del token directamente, sin aceptarlo como parámetro de URL.
-
-```go
-// Ejemplo: middleware que restringe /users/:username al propio usuario o a admins
-protected.Use(func(c *gin.Context) {
-    tokenUser := c.GetString("username") // set by your auth middleware
-    paramUser := c.Param("username")
-    if tokenUser != paramUser && !isAdmin(c) {
-        c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
-        return
-    }
-    c.Next()
-})
-```
-
----
-
 ## Endpoints
 
-Todos quedan bajo el prefijo que uses en `RegisterRoutes` (en los ejemplos, `/permissions`).
+Todos bajo el prefijo de `RegisterRoutes` (en los ejemplos, `/permissions`).
+
+### Aplicaciones
+
+| Método | Ruta | Body | Acción |
+|--------|------|------|--------|
+| `GET` | `/applications` | — | Listar |
+| `POST` | `/applications` | `{"key":"sat01","name":"SAT","description":"..."}` | Crear |
+| `PUT` | `/applications/:app` | `{"name":"...","description":"..."}` | Editar |
+| `DELETE` | `/applications/:app` | — | Borrar (cascada a sus `permission_types`) |
+
+`key` debe cumplir `^[a-zA-Z0-9_-]+$`.
 
 ### Tipos de permiso
 
 | Método | Ruta | Body | Acción |
 |--------|------|------|--------|
-| `GET` | `/types` | — | Listar catálogo |
-| `POST` | `/types` | `{"key":"screensAcceso","description":"...","defaultValue":0}` | Crear tipo |
+| `GET` | `/types` | — | Listar todos (todas las apps) |
+| `GET` | `/applications/:app/types` | — | Listar de una app |
+| `POST` | `/applications/:app/types` | `{"key":"crudSat","description":"...","defaultValue":0}` | Crear |
 | `PUT` | `/types/:id` | `{"description":"...","defaultValue":1}` | Editar |
 | `DELETE` | `/types/:id` | — | Borrar (cascada a role/user perms) |
 
-`key` debe cumplir `^[a-zA-Z0-9_-]+$`. `defaultValue` entre 0 y 3.
+Unicidad: `(application_key, key)`. La misma `key` puede existir en apps diferentes.
 
 ### Roles
 
 | Método | Ruta | Body | Acción |
 |--------|------|------|--------|
-| `GET` | `/roles` | — | Listar roles registrados |
-| `POST` | `/roles` | `{"name":"admin","description":"..."}` | Registrar rol |
-| `PUT` | `/roles/:name` | `{"description":"..."}` | Editar descripción |
-| `DELETE` | `/roles/:name` | — | Borrar rol + sus permisos (cascada) |
-| `GET` | `/roles/:name/permissions` | — | Ver permisos del rol |
-| `PUT` | `/roles/:name/permissions` | `{"permissions":{"screensAcceso":3}}` | Upsert masivo |
-| `DELETE` | `/roles/:name/permissions/:key` | — | Quitar un permiso del rol |
+| `GET` | `/roles` | — | Listar |
+| `POST` | `/roles` | `{"name":"admin","description":"..."}` | Crear |
+| `PUT` | `/roles/:name` | `{"description":"..."}` | Editar |
+| `DELETE` | `/roles/:name` | — | Borrar (cascada) |
+| `GET` | `/roles/:name/permissions` | — | Ver permisos |
+| `PUT` | `/roles/:name/permissions` | ver abajo | Upsert masivo |
+| `DELETE` | `/roles/:name/permissions/:app/:key` | — | Quitar uno |
 
-> Los roles vienen de tu authservice externo. Regístralos aquí manualmente antes de asignarles permisos. Los roles del token que no existan en esta tabla se ignoran en `Resolve`.
+Body del upsert (namespaced por app):
+
+```json
+{
+  "permissions": {
+    "sat01": { "crudSat": 3, "viewReports": 2 },
+    "cloud": { "crudCloud": 1 }
+  }
+}
+```
 
 ### Permisos de usuario
 
 | Método | Ruta | Body | Acción |
 |--------|------|------|--------|
-| `GET` | `/users/:username` | — | Ver overrides del usuario |
-| `PUT` | `/users/:username` | `{"permissions":{"screensAcceso":2}}` | Upsert masivo de overrides |
-| `DELETE` | `/users/:username/:key` | — | Quitar un override |
-| `POST` | `/users/:username/reset` | — | Borrar todos los overrides (vuelve a los de rol) |
-| `GET` | `/users/:username/resolved` | — | Preview del mapa resuelto (útil para debug/admin) |
+| `GET` | `/users/:username` | — | Ver overrides |
+| `PUT` | `/users/:username` | igual shape que en roles | Upsert masivo |
+| `DELETE` | `/users/:username/:app/:key` | — | Quitar override |
+| `POST` | `/users/:username/reset` | — | Borrar todos los overrides |
+| `GET` | `/users/:username/resolved` | — | Mapa resuelto |
+| `GET` | `/users/:username/resolved?app=sat01` | — | Mapa resuelto **plano** para esa app |
+| `GET` | `/users/:username/resolved?app=all` | — | Mapa **anidado** para todas |
 
-> Si el username no existe en tu tabla de usuarios, todos estos endpoints devuelven `404 user not found`. La librería **no crea usuarios**.
+### Directorio de usuarios
 
-#### Ejemplo: asignar un permiso único a un usuario concreto
+| Método | Ruta | Acción |
+|--------|------|--------|
+| `GET` | `/users?offset=0&limit=50` | Paginado, devuelve `{users, total, offset, limit}` |
 
-Para dar acceso a `bestagent` solo a `vicenteT`, sin usar roles:
+### Auditoría
 
-**Paso 1** — Crear el tipo de permiso (una sola vez):
-```http
-POST /permissions/types
-{"key": "bestagent", "description": "Acceso a best agent", "defaultValue": 0}
-```
+| Método | Ruta | Acción |
+|--------|------|--------|
+| `GET` | `/audit?offset=0&limit=50` | Listar entradas (más recientes primero) |
 
-**Paso 2** — Asignar el override al usuario:
-```http
-PUT /permissions/users/vicenteT
-{"permissions": {"bestagent": 1}}
-```
-
-**Verificar**:
-```http
-GET /permissions/users/vicenteT/resolved
-→ {"bestagent": 1, ...}
-```
-
-El resto de usuarios seguirán teniendo `bestagent: 0` (el `defaultValue`) a menos que también tengan un override o un rol con ese permiso.
+Cada entrada contiene: `actorUserId`, `action` (`grant`/`revoke`/`create`/`update`/`delete`/`reset_user`), `targetType` (`application`/`role`/`permission_type`/`user`), `targetId`, `permissionTypeId`, `oldValue`, `newValue`, `createdAt`.
 
 ---
 
-## Esquema SQL (si prefieres no usar AutoMigrate)
+## API del Service (sin Gin)
+
+Si no usas Gin, llama directamente al `Service`. Tienes dos variantes por mutación:
+
+- **Sin auditoría** (`CreateRole`, `UpsertUserPermission`, ...): útil para seeds / migraciones / tests.
+- **Con auditoría** (`CreateRoleAudited(actorID, ...)`, `UpsertUserPermissionAudited(actorID, ...)`): para flujos donde sí hay un actor identificado.
+
+```go
+// Login per-app
+perms, err := permSvc.Resolve(userID, []string{"admin"}, "sat01")
+
+// Panel admin (todas las apps)
+all, err := permSvc.ResolveAll(userID, []string{"admin"})
+
+// Batch para listados
+batch, err := permSvc.ResolveBatch([]permissions.UserRoles{
+    {UserID: 1, Roles: []string{"admin"}},
+    {UserID: 2, Roles: []string{"viewer"}},
+}, "sat01")
+
+// Mutación auditada
+err := permSvc.UpsertUserPermissionAudited(actorID, &permissions.UserPermission{
+    UserID: 42, PermissionTypeID: 7, Value: 3,
+})
+```
+
+---
+
+## Errores tipados
+
+```go
+permissions.ErrApplicationNotFound
+permissions.ErrApplicationExists
+permissions.ErrInvalidApplicationKey
+permissions.ErrRoleNotFound
+permissions.ErrRoleExists
+permissions.ErrInvalidRoleName
+permissions.ErrTypeNotFound
+permissions.ErrTypeKeyExists
+permissions.ErrInvalidValue
+```
+
+El adaptador `ginhttp` ya los mapea a los códigos HTTP correctos (`404`, `409`, `400`).
+
+---
+
+## Esquema SQL (si no usas AutoMigrate)
 
 ```sql
+CREATE TABLE applications (
+    `key`       VARCHAR(50)  NOT NULL,
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(255),
+    created_at  DATETIME,
+    updated_at  DATETIME,
+    PRIMARY KEY (`key`)
+);
+
 CREATE TABLE roles (
     name        VARCHAR(100) NOT NULL,
     description VARCHAR(255),
@@ -292,14 +330,17 @@ CREATE TABLE roles (
 );
 
 CREATE TABLE permission_types (
-    id            INT          NOT NULL AUTO_INCREMENT,
-    `key`         VARCHAR(100) NOT NULL,
-    description   VARCHAR(255),
-    default_value TINYINT      NOT NULL DEFAULT 0,
-    created_at    DATETIME,
-    updated_at    DATETIME,
+    id              INT          NOT NULL AUTO_INCREMENT,
+    application_key VARCHAR(50)  NOT NULL,
+    `key`           VARCHAR(100) NOT NULL,
+    description     VARCHAR(255),
+    default_value   TINYINT      NOT NULL DEFAULT 0,
+    created_at      DATETIME,
+    updated_at      DATETIME,
     PRIMARY KEY (id),
-    UNIQUE KEY uq_key (`key`)
+    UNIQUE KEY uq_app_key (application_key, `key`),
+    CONSTRAINT fk_pt_app FOREIGN KEY (application_key)
+        REFERENCES applications(`key`) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
 CREATE TABLE role_permissions (
@@ -317,8 +358,6 @@ CREATE TABLE role_permissions (
         REFERENCES permission_types(id) ON DELETE CASCADE
 );
 
--- user_id es opaco: este paquete no conoce tu tabla de usuarios.
--- Añade la FK a users(id) en tu propia migración si la necesitas.
 CREATE TABLE user_permissions (
     id                 INT     NOT NULL AUTO_INCREMENT,
     user_id            INT     NOT NULL,
@@ -331,79 +370,29 @@ CREATE TABLE user_permissions (
     CONSTRAINT fk_up_type FOREIGN KEY (permission_type_id)
         REFERENCES permission_types(id) ON DELETE CASCADE
 );
-```
 
-> PostgreSQL: cambia `TINYINT` por `SMALLINT` y `AUTO_INCREMENT` por `SERIAL`.
-
----
-
-## Errores tipados
-
-```go
-import "errors"
-import "github.com/liftelimasd/permissions"
-
-if errors.Is(err, permissions.ErrRoleNotFound)  { /* 404 */ }
-if errors.Is(err, permissions.ErrRoleExists)    { /* 409 */ }
-if errors.Is(err, permissions.ErrTypeNotFound)  { /* 404 */ }
-if errors.Is(err, permissions.ErrTypeKeyExists) { /* 409 */ }
-if errors.Is(err, permissions.ErrInvalidValue)  { /* 400 */ }
-if errors.Is(err, permissions.ErrInvalidRoleName) { /* 400 */ }
-```
-
-El adaptador `ginhttp` ya mapea estos errores a los códigos HTTP correctos.
-
----
-
-## Usar sin Gin (adaptador HTTP propio)
-
-Si tu servicio usa `echo`, `chi`, o `net/http` directamente, no importes `ginhttp`. Usa el `Service` directamente y escribe tus propios handlers:
-
-```go
-import "github.com/liftelimasd/permissions"
-
-// construir igual
-repo    := miRepo{}           // implementa permissions.Repository
-permSvc := permissions.NewService(repo)
-
-// en tu handler de login
-perms, err := permSvc.Resolve(userID, roleNames)
-
-// en tu handler de CRUD
-if err := permSvc.CreateType(&permissions.PermissionType{Key: "screensAcceso", DefaultValue: 0}); err != nil {
-    // mapea el error a tu formato de respuesta
-}
-```
-
-## Usar sin GORM (repositorio propio)
-
-Implementa la interfaz `permissions.Repository` con tu cliente preferido (sqlx, pgx, mongo, etc.):
-
-```go
-type myRepo struct{ /* tu cliente */ }
-
-func (r *myRepo) ListRoles() ([]permissions.Role, error)            { ... }
-func (r *myRepo) GetRole(name string) (*permissions.Role, error)    { ... }
-// ... resto de métodos de la interfaz
-
-permSvc := permissions.NewService(&myRepo{})
+CREATE TABLE permission_audit_log (
+    id                 INT          NOT NULL AUTO_INCREMENT,
+    actor_user_id      INT          NOT NULL,
+    action             VARCHAR(32)  NOT NULL,
+    target_type        VARCHAR(32)  NOT NULL,
+    target_id          VARCHAR(100) NOT NULL,
+    permission_type_id INT,
+    old_value          INT,
+    new_value          INT,
+    metadata           TEXT,
+    created_at         DATETIME,
+    PRIMARY KEY (id),
+    KEY idx_audit_actor (actor_user_id),
+    KEY idx_audit_target (target_type, target_id),
+    KEY idx_audit_created (created_at)
+);
 ```
 
 ---
 
-## Estructura del repositorio
+## Notas de seguridad
 
-```
-github.com/liftelimasd/permissions/
-  entity.go       — tipos de dominio + constantes + errores
-  repository.go   — interfaz Repository (puerto)
-  service.go      — Service: Resolve + CRUD con validaciones
-  gorm/
-    models.go     — modelos GORM de las 4 tablas
-    repository.go — NewRepository(db *gorm.DB) Repository
-    migrate.go    — Migrate(db *gorm.DB) error
-  ginhttp/
-    dto.go        — structs de request JSON
-    handler.go    — handlers Gin + interfaz UserFinder
-    routes.go     — RegisterRoutes(group, svc, uf)
-```
+- **`app=all` debe estar restringido a admins**. La librería no aplica esa restricción — la decides en tu handler de login o con un middleware.
+- **Token mínimo**: no metas todos los permisos en el JWT. El patrón aquí es token con `userID + roles + exp`, permisos en el body del login y/o consultados vía `/resolved` con cache local en el cliente.
+- **Auditoría no bloquea**: si la inserción del log falla, la operación principal continúa. El log es best-effort para no romper la BD ante un fallo de auditoría.

@@ -1,4 +1,4 @@
-module github.com/liftelimasd/permissions
+module github.com/liftelimasd/permissions/v2
 
 go 1.23.0
 
