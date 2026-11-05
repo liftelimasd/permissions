@@ -1,6 +1,13 @@
 package permissions
 
 type Repository interface {
+	// Applications
+	ListApplications() ([]Application, error)
+	GetApplication(key string) (*Application, error)
+	CreateApplication(app *Application) error
+	UpdateApplication(app *Application) error
+	DeleteApplication(key string) error
+
 	// Roles
 	ListRoles() ([]Role, error)
 	GetRole(name string) (*Role, error)
@@ -10,8 +17,9 @@ type Repository interface {
 
 	// Permission types
 	ListTypes() ([]PermissionType, error)
+	ListTypesByApp(appKey string) ([]PermissionType, error)
 	GetType(id int) (*PermissionType, error)
-	GetTypeByKey(key string) (*PermissionType, error)
+	GetTypeByKey(appKey, key string) (*PermissionType, error)
 	CreateType(pt *PermissionType) error
 	UpdateType(pt *PermissionType) error
 	DeleteType(id int) error
@@ -28,4 +36,16 @@ type Repository interface {
 	UpsertUserPermission(up *UserPermission) error
 	DeleteUserPermission(userID, permissionTypeID int) error
 	DeleteAllUserPermissions(userID int) error
+
+	// Audit log
+	InsertAuditLog(log *AuditLog) error
+	ListAuditLogs(offset, limit int) ([]AuditLog, int, error)
+}
+
+// TxRepository is an optional extension of Repository. When the repository
+// can run several operations in one transaction, Service.Atomic uses it so a
+// bulk change (and its audit rows) is applied entirely or not at all.
+type TxRepository interface {
+	Repository
+	WithTx(fn func(Repository) error) error
 }
