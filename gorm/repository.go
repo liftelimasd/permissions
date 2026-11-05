@@ -12,12 +12,20 @@ type repository struct {
 	db *gorm.DB
 }
 
-var _ permissions.Repository = (*repository)(nil)
+var _ permissions.TxRepository = (*repository)(nil)
 
 // NewRepository returns a permissions.Repository backed by GORM.
 // Pass your already-initialized *gorm.DB — this package never opens connections.
+// The returned value also implements permissions.TxRepository.
 func NewRepository(db *gorm.DB) permissions.Repository {
 	return &repository{db: db}
+}
+
+// WithTx runs fn against a repository bound to a single database transaction.
+func (r *repository) WithTx(fn func(permissions.Repository) error) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		return fn(&repository{db: tx})
+	})
 }
 
 // --- Applications ---
@@ -194,9 +202,11 @@ func (r *repository) UpsertRolePermission(rp *permissions.RolePermission) error 
 		UpdatedAt:        &now,
 	}
 	return r.db.
-		Where("role_name = ? AND permission_type_id = ?", rp.RoleName, rp.PermissionTypeID).
-		Assign(RolePermissionModel{Value: int8(rp.Value), UpdatedAt: &now}).
-		FirstOrCreate(&m).Error
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "role_name"}, {Name: "permission_type_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+		}).
+		Create(&m).Error
 }
 
 func (r *repository) DeleteRolePermission(roleName string, permissionTypeID int) error {

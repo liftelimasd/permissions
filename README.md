@@ -10,6 +10,8 @@ Sistema de permisos centralizado, multi-aplicación, con roles, overrides por us
 go get github.com/liftelimasd/permissions/v2@latest
 ```
 
+Usa `v2.0.1` o posterior: el tag `v2.0.0` apunta al commit de la v0.2.0 (módulo sin `/v2`) y Go no lo acepta.
+
 ```go
 import (
     "github.com/liftelimasd/permissions/v2"
@@ -68,6 +70,7 @@ type UserDirectory interface {
     FindByUsername(username string) (User, error)
     FindByID(id int) (User, error)
     List(offset, limit int) ([]User, int, error)
+    RolesOf(userID int) ([]string, error) // roles que el host asigna al usuario
 }
 
 type User struct {
@@ -106,6 +109,16 @@ func (d *myDirectory) List(offset, limit int) ([]ginhttp.User, int, error) {
         out[i] = ginhttp.User{ID: r.ID, Username: r.Login}
     }
     return out, int(total), err
+}
+```
+
+`RolesOf` devuelve los roles que el host asigna al usuario (por ejemplo, de una tabla `user_roles`). Lo usa `GET /users/:username/resolved` para que la vista previa coincida con lo que el usuario recibe de verdad:
+
+```go
+func (d *myDirectory) RolesOf(userID int) ([]string, error) {
+    var roles []string
+    err := d.db.Table("user_roles").Where("user_id = ?", userID).Pluck("role", &roles).Error
+    return roles, err
 }
 ```
 
@@ -212,6 +225,8 @@ Todos bajo el prefijo de `RegisterRoutes` (en los ejemplos, `/permissions`).
 
 Unicidad: `(application_key, key)`. La misma `key` puede existir en apps diferentes.
 
+`key` debe cumplir `^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`: admite puntos para agrupar permisos relacionados (`screens`, `screens.config`).
+
 ### Roles
 
 | Método | Ruta | Body | Acción |
@@ -235,6 +250,15 @@ Body del upsert (namespaced por app):
 }
 ```
 
+El cuerpo se valida entero antes de escribir nada:
+
+- Una aplicación o llave que no existe responde `400` con la lista en `unknown` (`["cloud:crudClod"]`).
+- Un valor fuera de 0–3 responde `400` con la lista en `invalid`.
+
+Si todo es válido, los cambios y su auditoría se aplican en una sola transacción cuando el repositorio implementa `TxRepository` (`permgorm` lo hace): o se aplican todos o ninguno.
+
+`DELETE /roles/:name` responde `409` si el host lo impide con `ErrRoleInUse` (por ejemplo, porque el rol sigue asignado a usuarios).
+
 ### Permisos de usuario
 
 | Método | Ruta | Body | Acción |
@@ -246,6 +270,8 @@ Body del upsert (namespaced por app):
 | `GET` | `/users/:username/resolved` | — | Mapa resuelto |
 | `GET` | `/users/:username/resolved?app=sat01` | — | Mapa resuelto **plano** para esa app |
 | `GET` | `/users/:username/resolved?app=all` | — | Mapa **anidado** para todas |
+
+`/resolved` usa los roles que devuelve `UserDirectory.RolesOf`.
 
 ### Directorio de usuarios
 
@@ -302,10 +328,15 @@ permissions.ErrRoleExists
 permissions.ErrInvalidRoleName
 permissions.ErrTypeNotFound
 permissions.ErrTypeKeyExists
+permissions.ErrInvalidTypeKey
 permissions.ErrInvalidValue
+permissions.ErrUnknownPermissions
+permissions.ErrRoleInUse // lo devuelve el host al borrar un rol en uso
 ```
 
 El adaptador `ginhttp` ya los mapea a los códigos HTTP correctos (`404`, `409`, `400`).
+
+Para agrupar varios cambios, `Service.Atomic(func(s *permissions.Service) error { ... })` los ejecuta en una transacción si el repositorio implementa `TxRepository`.
 
 ---
 

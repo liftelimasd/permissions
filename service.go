@@ -8,6 +8,8 @@ import (
 var (
 	roleNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	appKeyRegex   = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	// Type keys may use dots to group related permissions (screens.config).
+	typeKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 )
 
 type Service struct {
@@ -16,6 +18,19 @@ type Service struct {
 
 func NewService(repo Repository) *Service {
 	return &Service{repo: repo}
+}
+
+// Atomic runs fn with a Service bound to a single transaction when the
+// repository implements TxRepository: if fn returns an error, nothing it did
+// is kept. With a plain Repository, fn runs without a transaction.
+func (s *Service) Atomic(fn func(*Service) error) error {
+	txRepo, ok := s.repo.(TxRepository)
+	if !ok {
+		return fn(s)
+	}
+	return txRepo.WithTx(func(r Repository) error {
+		return fn(NewService(r))
+	})
 }
 
 // Resolve builds the final permissions map for a user in a single application.
@@ -367,7 +382,7 @@ func (s *Service) ResolveAllBatch(users []UserRoles) (map[int]map[string]map[str
 
 // --- Roles ---
 
-func (s *Service) ListRoles() ([]Role, error) { return s.repo.ListRoles() }
+func (s *Service) ListRoles() ([]Role, error)         { return s.repo.ListRoles() }
 func (s *Service) GetRole(name string) (*Role, error) { return s.repo.GetRole(name) }
 
 func (s *Service) CreateRole(role *Role) error {
@@ -457,6 +472,9 @@ func (s *Service) GetTypeByKey(appKey, key string) (*PermissionType, error) {
 }
 
 func (s *Service) CreateType(pt *PermissionType) error {
+	if !typeKeyRegex.MatchString(pt.Key) {
+		return ErrInvalidTypeKey
+	}
 	if err := validateValue(pt.DefaultValue); err != nil {
 		return err
 	}
@@ -638,17 +656,27 @@ func (s *Service) UpdateTypeAudited(actorID int, pt *PermissionType) error {
 		return err
 	}
 	id := pt.ID
-	s.audit(actorID, AuditActionUpdate, AuditTargetType, "", &id, nil, nil, "")
+	s.audit(actorID, AuditActionUpdate, AuditTargetType, s.typeTargetID(id), &id, nil, nil, "")
 	return nil
 }
 
 func (s *Service) DeleteTypeAudited(actorID int, id int) error {
+	target := s.typeTargetID(id) // read before the type disappears
 	if err := s.DeleteType(id); err != nil {
 		return err
 	}
 	tid := id
-	s.audit(actorID, AuditActionDelete, AuditTargetType, "", &tid, nil, nil, "")
+	s.audit(actorID, AuditActionDelete, AuditTargetType, target, &tid, nil, nil, "")
 	return nil
+}
+
+// typeTargetID returns "app:key" for the audit trail, or "" if the type is unknown.
+func (s *Service) typeTargetID(id int) string {
+	pt, err := s.repo.GetType(id)
+	if err != nil {
+		return ""
+	}
+	return pt.ApplicationKey + ":" + pt.Key
 }
 
 func (s *Service) UpsertRolePermissionAudited(actorID int, rp *RolePermission) error {

@@ -41,3 +41,11 @@ type Repository interface {
 	InsertAuditLog(log *AuditLog) error
 	ListAuditLogs(offset, limit int) ([]AuditLog, int, error)
 }
+
+// TxRepository is an optional extension of Repository. When the repository
+// can run several operations in one transaction, Service.Atomic uses it so a
+// bulk change (and its audit rows) is applied entirely or not at all.
+type TxRepository interface {
+	Repository
+	WithTx(fn func(Repository) error) error
+}

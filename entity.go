@@ -8,15 +8,21 @@ const (
 )
 
 var (
-	ErrRoleNotFound           = errors.New("role not found")
-	ErrRoleExists             = errors.New("role already exists")
-	ErrTypeNotFound           = errors.New("permission type not found")
-	ErrTypeKeyExists          = errors.New("permission type key already exists")
-	ErrInvalidValue           = errors.New("permission value must be between 0 and 3")
-	ErrInvalidRoleName        = errors.New("role name must match ^[a-zA-Z0-9_-]+$")
-	ErrApplicationNotFound    = errors.New("application not found")
-	ErrApplicationExists      = errors.New("application already exists")
-	ErrInvalidApplicationKey  = errors.New("application key must match ^[a-zA-Z0-9_-]+$")
+	ErrRoleNotFound          = errors.New("role not found")
+	ErrRoleExists            = errors.New("role already exists")
+	ErrTypeNotFound          = errors.New("permission type not found")
+	ErrTypeKeyExists         = errors.New("permission type key already exists")
+	ErrInvalidValue          = errors.New("permission value must be between 0 and 3")
+	ErrInvalidRoleName       = errors.New("role name must match ^[a-zA-Z0-9_-]+$")
+	ErrApplicationNotFound   = errors.New("application not found")
+	ErrApplicationExists     = errors.New("application already exists")
+	ErrInvalidApplicationKey = errors.New("application key must match ^[a-zA-Z0-9_-]+$")
+	ErrInvalidTypeKey        = errors.New("permission type key must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+	ErrUnknownPermissions    = errors.New("unknown application or permission key")
+	// ErrRoleInUse lets a host refuse to delete a role that is still assigned
+	// to users (for example when the roles table is shared with its user
+	// management). ginhttp maps it to 409.
+	ErrRoleInUse = errors.New("role is assigned to users")
 )
 
 type Application struct {
@@ -79,7 +85,7 @@ type AuditLog struct {
 	ActorUserID      int         `json:"actorUserId"`
 	Action           AuditAction `json:"action"`
 	TargetType       AuditTarget `json:"targetType"`
-	TargetID         string      `json:"targetId"`          // role name / app key / "userID:typeID" / type ID
+	TargetID         string      `json:"targetId"` // role name / app key / "userID:typeID" / type ID
 	PermissionTypeID *int        `json:"permissionTypeId,omitempty"`
 	OldValue         *int        `json:"oldValue,omitempty"`
 	NewValue         *int        `json:"newValue,omitempty"`

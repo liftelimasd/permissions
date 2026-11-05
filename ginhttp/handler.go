@@ -3,10 +3,11 @@ package ginhttp
 import (
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 
-	permissions "github.com/liftelimasd/permissions/v2"
 	"github.com/gin-gonic/gin"
+	permissions "github.com/liftelimasd/permissions/v2"
 )
 
 // User is the minimal shape this package needs about a user. The host can
@@ -26,6 +27,10 @@ type UserDirectory interface {
 	FindByUsername(username string) (User, error)
 	FindByID(id int) (User, error)
 	List(offset, limit int) (users []User, total int, err error)
+	// RolesOf returns the role names the host assigns to the user.
+	// GET /users/:username/resolved uses them, so the preview matches what
+	// the user really gets.
+	RolesOf(userID int) ([]string, error)
 }
 
 // ActorIDFromContext is called on every mutating endpoint to identify the
@@ -129,6 +134,12 @@ func httpErr(err error) (int, string) {
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, permissions.ErrInvalidApplicationKey):
 		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, permissions.ErrInvalidTypeKey):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, permissions.ErrUnknownPermissions):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, permissions.ErrRoleInUse):
+		return http.StatusConflict, err.Error()
 	default:
 		return http.StatusInternalServerError, err.Error()
 	}
@@ -376,10 +387,45 @@ func (h *Handler) upsertRolePermissions(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	changes, ok := h.validatePermissions(ctx, req.Permissions)
+	if !ok {
+		return
+	}
+	err := h.svc.Atomic(func(s *permissions.Service) error {
+		for _, c := range changes {
+			if err := s.UpsertRolePermissionAudited(actor, &permissions.RolePermission{
+				RoleName:         name,
+				PermissionTypeID: c.typeID,
+				Value:            c.value,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		code, msg := httpErr(err)
+		ctx.JSON(code, gin.H{"error": msg})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "role permissions updated"})
+}
+
+// permissionChange is one validated (type, value) pair of a bulk upsert.
+type permissionChange struct {
+	typeID int
+	value  int
+}
+
+// validatePermissions checks a bulk upsert body before anything is written:
+// every application and key must exist and every value must be in range.
+// When the body is not valid it answers 400 itself (listing the offending
+// "app:key" entries) and returns ok=false.
+func (h *Handler) validatePermissions(ctx *gin.Context, body map[string]map[string]int) ([]permissionChange, bool) {
 	types, err := h.svc.ListTypes()
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, false
 	}
 	// (appKey, key) → PermissionType
 	typeByAppKey := make(map[string]map[string]permissions.PermissionType)
@@ -389,28 +435,32 @@ func (h *Handler) upsertRolePermissions(ctx *gin.Context) {
 		}
 		typeByAppKey[t.ApplicationKey][t.Key] = t
 	}
-	for appKey, perms := range req.Permissions {
-		appTypes, ok := typeByAppKey[appKey]
-		if !ok {
-			continue
-		}
+	var changes []permissionChange
+	var unknown, invalid []string
+	for appKey, perms := range body {
 		for key, value := range perms {
-			pt, ok := appTypes[key]
-			if !ok {
-				continue
-			}
-			if err := h.svc.UpsertRolePermissionAudited(actor, &permissions.RolePermission{
-				RoleName:         name,
-				PermissionTypeID: pt.ID,
-				Value:            value,
-			}); err != nil {
-				code, msg := httpErr(err)
-				ctx.JSON(code, gin.H{"error": msg})
-				return
+			pt, ok := typeByAppKey[appKey][key]
+			switch {
+			case !ok:
+				unknown = append(unknown, appKey+":"+key)
+			case value < permissions.MinValue || value > permissions.MaxValue:
+				invalid = append(invalid, appKey+":"+key)
+			default:
+				changes = append(changes, permissionChange{typeID: pt.ID, value: value})
 			}
 		}
 	}
-	ctx.JSON(http.StatusOK, gin.H{"message": "role permissions updated"})
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": permissions.ErrUnknownPermissions.Error(), "unknown": unknown})
+		return nil, false
+	}
+	if len(invalid) > 0 {
+		sort.Strings(invalid)
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": permissions.ErrInvalidValue.Error(), "invalid": invalid})
+		return nil, false
+	}
+	return changes, true
 }
 
 // deleteRolePermission removes one permission by (app, key) from a role.
@@ -462,38 +512,26 @@ func (h *Handler) upsertUserPermissions(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	types, err := h.svc.ListTypes()
-	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	changes, ok := h.validatePermissions(ctx, req.Permissions)
+	if !ok {
 		return
 	}
-	typeByAppKey := make(map[string]map[string]permissions.PermissionType)
-	for _, t := range types {
-		if typeByAppKey[t.ApplicationKey] == nil {
-			typeByAppKey[t.ApplicationKey] = make(map[string]permissions.PermissionType)
-		}
-		typeByAppKey[t.ApplicationKey][t.Key] = t
-	}
-	for appKey, perms := range req.Permissions {
-		appTypes, ok := typeByAppKey[appKey]
-		if !ok {
-			continue
-		}
-		for key, value := range perms {
-			pt, ok := appTypes[key]
-			if !ok {
-				continue
-			}
-			if err := h.svc.UpsertUserPermissionAudited(actor, &permissions.UserPermission{
+	err := h.svc.Atomic(func(s *permissions.Service) error {
+		for _, c := range changes {
+			if err := s.UpsertUserPermissionAudited(actor, &permissions.UserPermission{
 				UserID:           userID,
-				PermissionTypeID: pt.ID,
-				Value:            value,
+				PermissionTypeID: c.typeID,
+				Value:            c.value,
 			}); err != nil {
-				code, msg := httpErr(err)
-				ctx.JSON(code, gin.H{"error": msg})
-				return
+				return err
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		code, msg := httpErr(err)
+		ctx.JSON(code, gin.H{"error": msg})
+		return
 	}
 	ctx.JSON(http.StatusOK, gin.H{"message": "user permissions updated"})
 }
@@ -537,7 +575,8 @@ func (h *Handler) resetUserPermissions(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"message": "user permissions reset"})
 }
 
-// resolvedPermissions returns the resolved permission map for a user.
+// resolvedPermissions returns the resolved permission map for a user, using
+// the roles the host assigns to them (UserDirectory.RolesOf).
 //
 // Query params:
 //
@@ -550,9 +589,14 @@ func (h *Handler) resolvedPermissions(ctx *gin.Context) {
 	if !ok {
 		return
 	}
+	roles, err := h.dir.RolesOf(userID)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	app := ctx.Query("app")
 	if app == "" || app == "all" {
-		perms, err := h.svc.ResolveAll(userID, nil)
+		perms, err := h.svc.ResolveAll(userID, roles)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -560,7 +604,7 @@ func (h *Handler) resolvedPermissions(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, perms)
 		return
 	}
-	perms, err := h.svc.Resolve(userID, nil, app)
+	perms, err := h.svc.Resolve(userID, roles, app)
 	if err != nil {
 		code, msg := httpErr(err)
 		ctx.JSON(code, gin.H{"error": msg})
