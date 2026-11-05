@@ -12,6 +12,8 @@ go get github.com/liftelimasd/permissions/v2@latest
 
 Usa `v2.0.1` o posterior: el tag `v2.0.0` apunta al commit de la v0.2.0 (módulo sin `/v2`) y Go no lo acepta.
 
+Las versiones de `go.mod` son mínimas y se mantienen en las que ya usa el anfitrión (gin 1.10.0, gorm 1.25.12): añadir la librería no sube ninguna dependencia de quien la importa. No las subas sin revisar a los anfitriones.
+
 ```go
 import (
     "github.com/liftelimasd/permissions/v2"
